@@ -12,3 +12,4 @@ pub mod pics;
 pub mod proto;
 pub mod session;
 pub mod steam_api;
+pub mod workshop;
