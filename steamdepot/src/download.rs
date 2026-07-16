@@ -1,4 +1,5 @@
-use std::io::{Seek, SeekFrom, Write};
+use std::collections::HashSet;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,6 +24,9 @@ pub struct PrepareResult {
     pub files_created: u64,
     pub symlinks_created: u64,
     pub total_bytes: u64,
+    /// Regular files that already existed at the manifest's target size,
+    /// left untouched pending chunk-level verification.
+    pub verify_candidates: Vec<PathBuf>,
 }
 
 /// Decrypt all encrypted filenames in a manifest in-place.
@@ -48,6 +52,13 @@ pub fn decrypt_manifest_filenames(manifest: &mut DepotManifest, key: &[u8]) -> R
 ///
 /// Handles directories (flag 0x40), symlinks (flag 0x200), and regular files.
 /// For regular files, sets executable permission when flag 0x20 is set.
+///
+/// A regular file that already exists on disk at exactly the manifest's
+/// target size is left untouched (not truncated) and added to
+/// `result.verify_candidates`, so its content can be checked chunk-by-chunk
+/// against the manifest instead of being blindly redownloaded -- anything
+/// else (missing, wrong size) is freshly created/truncated as before, since
+/// there's nothing worth verifying.
 pub async fn prepare_directory_tree(
     install_dir: &Path,
     manifest: &DepotManifest,
@@ -57,6 +68,7 @@ pub async fn prepare_directory_tree(
         files_created: 0,
         symlinks_created: 0,
         total_bytes: 0,
+        verify_candidates: Vec::new(),
     };
 
     // Sort mappings by filename for deterministic creation order
@@ -103,9 +115,16 @@ pub async fn prepare_directory_tree(
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            let file = tokio::fs::File::create(&path).await?;
-            file.set_len(size).await?;
-            result.files_created += 1;
+
+            let existing_size = tokio::fs::metadata(&path).await.ok().map(|m| m.len());
+            if existing_size == Some(size) {
+                // Already the right size -- keep content as-is, verify later.
+                result.verify_candidates.push(path.clone());
+            } else {
+                let file = tokio::fs::File::create(&path).await?;
+                file.set_len(size).await?;
+                result.files_created += 1;
+            }
             result.total_bytes += size;
 
             // Set executable permission
@@ -120,28 +139,60 @@ pub async fn prepare_directory_tree(
     Ok(result)
 }
 
-/// Progress report for chunk downloads.
+/// Read `size` bytes at `offset` from `path` and check them against the
+/// chunk's expected (decompressed) SHA1. Any I/O error is treated as "not
+/// verified" (falls back to redownloading that chunk).
+fn verify_chunk_on_disk(path: &Path, offset: u64, size: u64, expected_sha_hex: &str) -> bool {
+    (|| -> Result<bool> {
+        use sha1::{Digest, Sha1};
+
+        let mut file = std::fs::File::open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; size as usize];
+        file.read_exact(&mut buf)?;
+
+        let mut hasher = Sha1::new();
+        hasher.update(&buf);
+        let actual_hex: String = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+
+        Ok(actual_hex.eq_ignore_ascii_case(expected_sha_hex))
+    })()
+    .unwrap_or(false)
+}
+
+/// Progress report for chunk downloads/verification.
 #[derive(Debug, Clone)]
 pub struct DownloadProgress {
     pub chunks_done: u64,
     pub chunks_total: u64,
+    /// Chunks that turned out to already be correct on disk and were
+    /// skipped rather than redownloaded (subset of `chunks_done`).
+    pub chunks_verified: u64,
     pub bytes_downloaded: u64,
 }
 
-/// A single chunk download job.
+/// A single chunk's work: verify-then-maybe-download, or download outright.
 struct ChunkJob {
     path: PathBuf,
     sha_hex: String,
     crc: u32,
     offset: u64,
+    /// Decompressed size, needed to read the right range for verification.
+    original_size: u64,
+    /// Whether this chunk's file already exists at the manifest's target
+    /// size and is therefore worth verifying before redownloading.
+    needs_verify: bool,
 }
 
-/// Download all chunks for a depot concurrently, rotating CDN servers on failure.
-///
-/// Flattens all chunks across all files into a work queue and processes them
-/// with bounded concurrency. Each chunk is retried up to `MAX_RETRIES` times,
-/// penalizing the failing server in the pool on transient errors.
-pub async fn download_depot(
+/// Prepare the directory tree, then verify and download a depot's chunks --
+/// always in that order, so nothing gets downloaded without first checking
+/// whether it's already correct on disk. Verification and downloading run
+/// as a single pool of concurrent tasks (bounded by `max_concurrent`):
+/// chunks needing verification and chunks needing a network fetch are
+/// interleaved on the same executor rather than run as two back-to-back
+/// phases, so disk I/O and network I/O overlap instead of one blocking
+/// the other.
+pub async fn sync_depot(
     client: &reqwest::Client,
     pool: Arc<Mutex<CdnPool>>,
     depot_id: u32,
@@ -150,8 +201,13 @@ pub async fn download_depot(
     install_dir: &Path,
     max_concurrent: usize,
     on_progress: impl Fn(&DownloadProgress) + Send + Sync + 'static,
-) -> Result<DownloadProgress> {
-    // Flatten all chunks into a work queue
+) -> Result<(PrepareResult, DownloadProgress)> {
+    let prepared = prepare_directory_tree(install_dir, manifest).await?;
+    let verify_candidates: HashSet<PathBuf> = prepared.verify_candidates.iter().cloned().collect();
+
+    // Flatten all chunks into a work queue, tagging which ones are worth
+    // verifying (their file already exists at the right size) vs. which
+    // definitely need downloading (freshly (re)created, empty file).
     let mut jobs = Vec::new();
     for mapping in &manifest.payload.mappings {
         let flags = mapping.flags.unwrap_or(0);
@@ -168,6 +224,7 @@ pub async fn download_depot(
 
         let normalized = filename.replace('\\', "/");
         let path = install_dir.join(&normalized);
+        let needs_verify = verify_candidates.contains(&path);
 
         for chunk in &mapping.chunks {
             let sha_bytes = chunk.sha.as_deref().unwrap_or(&[]);
@@ -177,12 +234,15 @@ pub async fn download_depot(
                 sha_hex,
                 crc: chunk.crc.unwrap_or(0),
                 offset: chunk.offset.unwrap_or(0),
+                original_size: chunk.cb_original.unwrap_or(0) as u64,
+                needs_verify,
             });
         }
     }
 
     let chunks_total = jobs.len() as u64;
     let chunks_done = Arc::new(AtomicU64::new(0));
+    let chunks_verified = Arc::new(AtomicU64::new(0));
     let bytes_downloaded = Arc::new(AtomicU64::new(0));
     let on_progress = Arc::new(on_progress);
 
@@ -195,27 +255,43 @@ pub async fn download_depot(
         let pool = pool.clone();
         let depot_key = depot_key.to_vec();
         let chunks_done = chunks_done.clone();
+        let chunks_verified = chunks_verified.clone();
         let bytes_downloaded = bytes_downloaded.clone();
         let on_progress = on_progress.clone();
 
         join_set.spawn(async move {
-            let result = download_chunk_with_retry(
-                &client,
-                &pool,
-                depot_id,
-                &job,
-                &depot_key,
-            )
-            .await;
-            drop(permit);
+            let _permit = permit;
+
+            let mut verified = false;
+            if job.needs_verify {
+                let path = job.path.clone();
+                let offset = job.offset;
+                let size = job.original_size;
+                let sha_hex = job.sha_hex.clone();
+                verified = tokio::task::spawn_blocking(move || {
+                    verify_chunk_on_disk(&path, offset, size, &sha_hex)
+                })
+                .await
+                .unwrap_or(false);
+            }
+
+            let result = if verified {
+                Ok(0)
+            } else {
+                download_chunk_with_retry(&client, &pool, depot_id, &job, &depot_key).await
+            };
 
             match result {
                 Ok(chunk_bytes) => {
                     bytes_downloaded.fetch_add(chunk_bytes, Ordering::Relaxed);
                     chunks_done.fetch_add(1, Ordering::Relaxed);
+                    if verified {
+                        chunks_verified.fetch_add(1, Ordering::Relaxed);
+                    }
                     on_progress(&DownloadProgress {
                         chunks_done: chunks_done.load(Ordering::Relaxed),
                         chunks_total,
+                        chunks_verified: chunks_verified.load(Ordering::Relaxed),
                         bytes_downloaded: bytes_downloaded.load(Ordering::Relaxed),
                     });
                     Ok(())
@@ -240,11 +316,15 @@ pub async fn download_depot(
         }
     }
 
-    Ok(DownloadProgress {
-        chunks_done: chunks_done.load(Ordering::Relaxed),
-        chunks_total,
-        bytes_downloaded: bytes_downloaded.load(Ordering::Relaxed),
-    })
+    Ok((
+        prepared,
+        DownloadProgress {
+            chunks_done: chunks_done.load(Ordering::Relaxed),
+            chunks_total,
+            chunks_verified: chunks_verified.load(Ordering::Relaxed),
+            bytes_downloaded: bytes_downloaded.load(Ordering::Relaxed),
+        },
+    ))
 }
 
 /// Download, decrypt, decompress, verify, and write a single chunk with retries.
