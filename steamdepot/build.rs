@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "proto/steam/steammessages_auth.steamclient.proto",
             "proto/steam/content_manifest.proto",
         ],
-        &["proto/steam"],
+        &["proto/steam", "proto"],
     )?;
     Ok(())
 }
