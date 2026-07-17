@@ -406,7 +406,7 @@ async fn download_chunk_with_retry(
 ) -> Result<u64> {
     for attempt in 0..=MAX_RETRIES {
         let (server, cdn_token) = {
-            let pool = pool.lock().unwrap();
+            let mut pool = pool.lock().unwrap();
             let server = pool.pick_server().clone();
             let token = pool
                 .get_cdn_auth_token(depot_id, &server.host)

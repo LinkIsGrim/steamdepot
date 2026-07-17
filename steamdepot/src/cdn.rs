@@ -52,6 +52,8 @@ pub struct CdnPool {
     penalties: HashMap<String, u32>,
     /// CDN auth tokens keyed by `"depot_id:host"`.
     cdn_auth_tokens: HashMap<String, CdnAuthToken>,
+    /// Round-robin cursor for `pick_server` -- see its docs.
+    next: usize,
 }
 
 impl CdnPool {
@@ -61,17 +63,45 @@ impl CdnPool {
             servers,
             penalties: HashMap::new(),
             cdn_auth_tokens: HashMap::new(),
+            next: 0,
         }
     }
 
-    /// Pick the best server: lowest penalty score, breaking ties by list order.
+    /// Pick a server, round-robining among whichever servers currently share
+    /// the lowest penalty score.
+    ///
+    /// Previously this always returned the single lowest-penalty server
+    /// (deterministic tie-break), which under normal healthy conditions
+    /// (no `penalize` calls yet) meant *every* concurrent chunk download,
+    /// across every depot/mod syncing at once, hit the exact same one CDN
+    /// edge server -- observed in practice capping aggregate throughput at
+    /// under 400Mbps on a ~1Gbps link with plenty of spare disk bandwidth,
+    /// almost certainly that single server's own per-client limit rather
+    /// than anything on our end. Round-robining across the full healthy set
+    /// Steam handed back spreads concurrent load across every one of them.
+    /// A penalized server naturally drops out of the min-penalty tier (and
+    /// so out of rotation) until everything else is equally penalized.
     ///
     /// Panics if the server list is empty.
-    pub fn pick_server(&self) -> &CdnServer {
-        self.servers
+    pub fn pick_server(&mut self) -> &CdnServer {
+        let min_penalty = self
+            .servers
             .iter()
-            .min_by_key(|s| self.penalties.get(&s.host).copied().unwrap_or(0))
-            .expect("CdnPool has no servers")
+            .map(|s| self.penalties.get(&s.host).copied().unwrap_or(0))
+            .min()
+            .expect("CdnPool has no servers");
+        // Indices rather than references, so this doesn't hold a borrow of
+        // `self` across the `self.next` update below.
+        let candidates: Vec<usize> = self
+            .servers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| self.penalties.get(&s.host).copied().unwrap_or(0) == min_penalty)
+            .map(|(i, _)| i)
+            .collect();
+        let idx = candidates[self.next % candidates.len()];
+        self.next = self.next.wrapping_add(1);
+        &self.servers[idx]
     }
 
     /// Increment penalty for a host (called on transient HTTP failures).
