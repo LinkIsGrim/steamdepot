@@ -1,5 +1,6 @@
-use std::collections::HashSet;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -140,16 +141,18 @@ pub async fn prepare_directory_tree(
 }
 
 /// Read `size` bytes at `offset` from `path` and check them against the
-/// chunk's expected (decompressed) SHA1. Any I/O error is treated as "not
-/// verified" (falls back to redownloading that chunk).
-fn verify_chunk_on_disk(path: &Path, offset: u64, size: u64, expected_sha_hex: &str) -> bool {
+/// chunk's expected (decompressed) SHA1, using a positioned read against an
+/// already-open, shared file handle (see [`open_verify_files`]) instead of
+/// opening the file itself -- `pread` is stateless (no seek, no shared
+/// cursor), so many chunks belonging to the same file can safely verify
+/// concurrently off one `File`. Any I/O error is treated as "not verified"
+/// (falls back to redownloading that chunk).
+fn verify_chunk_on_disk(file: &std::fs::File, offset: u64, size: u64, expected_sha_hex: &str) -> bool {
     (|| -> Result<bool> {
         use sha1::{Digest, Sha1};
 
-        let mut file = std::fs::File::open(path)?;
-        file.seek(SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; size as usize];
-        file.read_exact(&mut buf)?;
+        read_exact_at(file, &mut buf, offset)?;
 
         let mut hasher = Sha1::new();
         hasher.update(&buf);
@@ -158,6 +161,41 @@ fn verify_chunk_on_disk(path: &Path, offset: u64, size: u64, expected_sha_hex: &
         Ok(actual_hex.eq_ignore_ascii_case(expected_sha_hex))
     })()
     .unwrap_or(false)
+}
+
+/// Like `Read::read_exact`, but as a positioned read (`pread`) that doesn't
+/// touch the file's shared cursor -- stable `FileExt::read_at` doesn't
+/// guarantee filling the buffer in one call, so loop until it's full.
+fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match file.read_at(buf, offset) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF during positioned read",
+                ))
+            }
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Open every verify-candidate file once, up front, so per-chunk
+/// verification can share the handle via `pread` instead of each chunk
+/// opening the file itself. Files that fail to open are simply left out --
+/// their chunks fall back to `needs_verify: false` (redownload) in the
+/// caller.
+fn open_verify_files(candidates: &HashSet<PathBuf>) -> HashMap<PathBuf, Arc<std::fs::File>> {
+    candidates
+        .iter()
+        .filter_map(|path| std::fs::File::open(path).ok().map(|f| (path.clone(), Arc::new(f))))
+        .collect()
 }
 
 /// Progress report for chunk downloads/verification.
@@ -179,9 +217,10 @@ struct ChunkJob {
     offset: u64,
     /// Decompressed size, needed to read the right range for verification.
     original_size: u64,
-    /// Whether this chunk's file already exists at the manifest's target
-    /// size and is therefore worth verifying before redownloading.
-    needs_verify: bool,
+    /// Shared handle to this chunk's file, already open, if it's a verify
+    /// candidate (see [`open_verify_files`]) -- `None` means either the
+    /// file is freshly created (nothing to verify) or it failed to open.
+    verify_file: Option<Arc<std::fs::File>>,
 }
 
 /// Prepare the directory tree, then verify and download a depot's chunks --
@@ -204,6 +243,11 @@ pub async fn sync_depot(
 ) -> Result<(PrepareResult, DownloadProgress)> {
     let prepared = prepare_directory_tree(install_dir, manifest).await?;
     let verify_candidates: HashSet<PathBuf> = prepared.verify_candidates.iter().cloned().collect();
+    // Open each verify candidate exactly once, up front, instead of every
+    // one of its chunks opening the file itself -- a depot's chunks are
+    // typically spread across far fewer actual files, so this cuts
+    // thousands of redundant open() calls down to one per file.
+    let verify_files = open_verify_files(&verify_candidates);
 
     // Flatten all chunks into a work queue, tagging which ones are worth
     // verifying (their file already exists at the right size) vs. which
@@ -224,7 +268,7 @@ pub async fn sync_depot(
 
         let normalized = filename.replace('\\', "/");
         let path = install_dir.join(&normalized);
-        let needs_verify = verify_candidates.contains(&path);
+        let verify_file = verify_files.get(&path).cloned();
 
         for chunk in &mapping.chunks {
             let sha_bytes = chunk.sha.as_deref().unwrap_or(&[]);
@@ -235,7 +279,7 @@ pub async fn sync_depot(
                 crc: chunk.crc.unwrap_or(0),
                 offset: chunk.offset.unwrap_or(0),
                 original_size: chunk.cb_original.unwrap_or(0) as u64,
-                needs_verify,
+                verify_file: verify_file.clone(),
             });
         }
     }
@@ -274,14 +318,13 @@ pub async fn sync_depot(
 
         join_set.spawn(async move {
             let mut verified = false;
-            if job.needs_verify {
+            if let Some(file) = job.verify_file.clone() {
                 let permit = verify_semaphore.acquire_owned().await.unwrap();
-                let path = job.path.clone();
                 let offset = job.offset;
                 let size = job.original_size;
                 let sha_hex = job.sha_hex.clone();
                 verified = tokio::task::spawn_blocking(move || {
-                    verify_chunk_on_disk(&path, offset, size, &sha_hex)
+                    verify_chunk_on_disk(&file, offset, size, &sha_hex)
                 })
                 .await
                 .unwrap_or(false);
