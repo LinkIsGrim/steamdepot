@@ -99,7 +99,7 @@ impl CdnPool {
 }
 
 /// Parsed depot manifest from CDN.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct DepotManifest {
     pub payload: ContentManifestPayload,
     pub metadata: ContentManifestMetadata,

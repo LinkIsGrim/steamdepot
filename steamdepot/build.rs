@@ -1,5 +1,19 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    prost_build::compile_protos(
+    // Manifest types get serde derives so callers can cache a resolved
+    // DepotManifest to disk (keyed by depot_id + manifest_id) instead of
+    // refetching it from the CDN every run when nothing's changed.
+    let mut config = prost_build::Config::new();
+    for ty in [
+        "ContentManifestPayload",
+        "ContentManifestPayload.FileMapping",
+        "ContentManifestPayload.FileMapping.ChunkData",
+        "ContentManifestMetadata",
+        "ContentManifestSignature",
+    ] {
+        config.type_attribute(ty, "#[derive(serde::Serialize, serde::Deserialize)]");
+    }
+
+    config.compile_protos(
         &[
             "proto/steam/steammessages_base.proto",
             "proto/steam/steammessages_clientserver_login.proto",
