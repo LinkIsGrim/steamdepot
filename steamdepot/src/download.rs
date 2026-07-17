@@ -284,6 +284,16 @@ pub async fn sync_depot(
         }
     }
 
+    // Every job holding a verify_file now has its own Arc clone -- drop the
+    // master map's references so each file's *last* referencing chunk task
+    // actually closes it (Arc refcount hits zero) as soon as that file's
+    // own chunks are done, instead of every verify candidate staying open
+    // for the entire depot's sync_depot() call regardless of how early its
+    // own chunks finished. With depots that can have 1000+ files, holding
+    // them all open for the whole call was blowing through the process's
+    // file descriptor limit under concurrent depot/mod syncs.
+    drop(verify_files);
+
     let chunks_total = jobs.len() as u64;
     let chunks_done = Arc::new(AtomicU64::new(0));
     let chunks_verified = Arc::new(AtomicU64::new(0));
