@@ -23,6 +23,15 @@ use crate::steam_api::cm_list::{self, CmServerType};
 ///
 /// This is the shared setup for all auth flows — the anonymous login
 /// establishes the session required for service method calls.
+/// Open a fresh CM connection for the auth-negotiation flow (RSA key,
+/// begin auth session, poll). No login here -- those calls all go out
+/// unauthenticated (`service_method_call_unauthed`), since they exist
+/// specifically to establish a new session and shouldn't require one to
+/// already be logged on. An anonymous ClientLogon used to happen here
+/// first, which cost a full extra round-trip for no benefit -- the
+/// account's actual session gets established afterward, over a *different*
+/// connection, via `login::login_with_token` once auth negotiation hands
+/// back a refresh token.
 async fn connect_and_login() -> Result<CmConnection> {
     let client = reqwest::Client::new();
     let cm_list = cm_list::get_cm_list(&client).await?;
@@ -33,10 +42,7 @@ async fn connect_and_login() -> Result<CmConnection> {
         .find(|s| s.server_type == CmServerType::Websockets)
         .ok_or_else(|| Error::Other("no websocket CM server found".into()))?;
 
-    let mut conn = CmConnection::connect(&ws_server.endpoint).await?;
-    login::login_anonymous(&mut conn).await?;
-
-    Ok(conn)
+    CmConnection::connect(&ws_server.endpoint).await
 }
 
 /// Begin an authenticated session: resolve a CM server, connect, fetch the
