@@ -246,11 +246,22 @@ pub async fn sync_depot(
     let bytes_downloaded = Arc::new(AtomicU64::new(0));
     let on_progress = Arc::new(on_progress);
 
-    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+    // Verification (local disk read + SHA1) and downloading (network,
+    // rate-limited by courtesy to the CDN) have very different ideal
+    // concurrency levels -- gating both behind one `max_concurrent`
+    // semaphore throttles cheap local verification down to network speed
+    // for no reason. Each job spawns immediately and acquires whichever
+    // semaphore its actual work needs, instead of the whole task waiting
+    // on one shared permit before it can even start verifying.
+    let verify_concurrency = std::thread::available_parallelism()
+        .map(|n| n.get() * 4)
+        .unwrap_or(16)
+        .clamp(16, 128);
+    let verify_semaphore = Arc::new(Semaphore::new(verify_concurrency));
+    let download_semaphore = Arc::new(Semaphore::new(max_concurrent));
     let mut join_set = JoinSet::new();
 
     for job in jobs {
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
         let client = client.clone();
         let pool = pool.clone();
         let depot_key = depot_key.to_vec();
@@ -258,12 +269,13 @@ pub async fn sync_depot(
         let chunks_verified = chunks_verified.clone();
         let bytes_downloaded = bytes_downloaded.clone();
         let on_progress = on_progress.clone();
+        let verify_semaphore = verify_semaphore.clone();
+        let download_semaphore = download_semaphore.clone();
 
         join_set.spawn(async move {
-            let _permit = permit;
-
             let mut verified = false;
             if job.needs_verify {
+                let permit = verify_semaphore.acquire_owned().await.unwrap();
                 let path = job.path.clone();
                 let offset = job.offset;
                 let size = job.original_size;
@@ -273,11 +285,13 @@ pub async fn sync_depot(
                 })
                 .await
                 .unwrap_or(false);
+                drop(permit);
             }
 
             let result = if verified {
                 Ok(0)
             } else {
+                let _permit = download_semaphore.acquire_owned().await.unwrap();
                 download_chunk_with_retry(&client, &pool, depot_id, &job, &depot_key).await
             };
 
