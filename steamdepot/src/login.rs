@@ -110,7 +110,7 @@ pub async fn get_password_rsa_key(
         account_name: Some(account_name.to_string()),
     };
     let resp_bytes = conn
-        .service_method_call_unauthed(
+        .service_method_call(
             "Authentication.GetPasswordRSAPublicKey#1",
             &req.encode_to_vec(),
         )
@@ -170,7 +170,7 @@ pub async fn begin_auth_session(
         ..Default::default()
     };
     let resp_bytes = conn
-        .service_method_call_unauthed(
+        .service_method_call(
             "Authentication.BeginAuthSessionViaCredentials#1",
             &req.encode_to_vec(),
         )
@@ -217,7 +217,7 @@ pub async fn begin_auth_session_passwordless(
         ..Default::default()
     };
     let resp_bytes = conn
-        .service_method_call_unauthed(
+        .service_method_call(
             "Authentication.BeginAuthSessionViaCredentials#1",
             &req.encode_to_vec(),
         )
@@ -253,7 +253,7 @@ pub async fn submit_guard_code(
         code: Some(code.to_string()),
         code_type: Some(code_type as i32),
     };
-    conn.service_method_call_unauthed(
+    conn.service_method_call(
         "Authentication.UpdateAuthSessionWithSteamGuardCode#1",
         &req.encode_to_vec(),
     )
@@ -273,7 +273,7 @@ pub async fn poll_auth_status(
             ..Default::default()
         };
         let resp_bytes = conn
-            .service_method_call_unauthed(
+            .service_method_call(
                 "Authentication.PollAuthSessionStatus#1",
                 &req.encode_to_vec(),
             )
