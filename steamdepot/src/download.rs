@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,6 +11,7 @@ use crate::cdn::{CdnPool, DepotManifest};
 use crate::crypto;
 use crate::error::{Error, Result};
 
+#[cfg_attr(windows, allow(dead_code))] // only read inside the #[cfg(unix)] executable-bit block below
 const FLAG_EXECUTABLE: u32 = 0x20;
 const FLAG_DIRECTORY: u32 = 0x40;
 const FLAG_SYMLINK: u32 = 0x200;
@@ -109,7 +109,13 @@ pub async fn prepare_directory_tree(
             }
             // Remove existing file/symlink if present
             let _ = tokio::fs::remove_file(&path).await;
+            // Depot manifest symlinks are always file symlinks (game data,
+            // never directories) -- Windows distinguishes the two at
+            // creation time, unlike Unix, hence the separate call.
+            #[cfg(unix)]
             tokio::fs::symlink(target, &path).await?;
+            #[cfg(windows)]
+            tokio::fs::symlink_file(target, &path).await?;
             result.symlinks_created += 1;
         } else {
             // Regular file
@@ -128,7 +134,10 @@ pub async fn prepare_directory_tree(
             }
             result.total_bytes += size;
 
-            // Set executable permission
+            // Set executable permission -- no equivalent on Windows (files
+            // there are "executable" by extension, not a permission bit),
+            // so this is a no-op there rather than something to translate.
+            #[cfg(unix)]
             if flags & FLAG_EXECUTABLE != 0 {
                 use std::os::unix::fs::PermissionsExt;
                 let perms = std::fs::Permissions::from_mode(0o755);
@@ -163,12 +172,26 @@ fn verify_chunk_on_disk(file: &std::fs::File, offset: u64, size: u64, expected_s
     .unwrap_or(false)
 }
 
+/// Positioned read (`pread` on Unix, `seek_read` on Windows) that doesn't
+/// touch the file's shared cursor -- the two platforms' std APIs for this
+/// happen to share an identical signature, so this is the only
+/// OS-specific bit `read_exact_at` needs.
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+}
+
 /// Like `Read::read_exact`, but as a positioned read (`pread`) that doesn't
-/// touch the file's shared cursor -- stable `FileExt::read_at` doesn't
-/// guarantee filling the buffer in one call, so loop until it's full.
+/// touch the file's shared cursor -- stable `FileExt::read_at`/`seek_read`
+/// don't guarantee filling the buffer in one call, so loop until it's full.
 fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
     while !buf.is_empty() {
-        match file.read_at(buf, offset) {
+        match read_at(file, buf, offset) {
             Ok(0) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
