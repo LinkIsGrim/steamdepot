@@ -5,7 +5,8 @@ use crate::emsg::EMsg;
 use crate::error::{Error, Result};
 use crate::proto::{
     c_msg_ip_address, CAuthenticationBeginAuthSessionViaCredentialsRequest,
-    CAuthenticationBeginAuthSessionViaCredentialsResponse, CAuthenticationDeviceDetails,
+    CAuthenticationBeginAuthSessionViaCredentialsResponse, CAuthenticationBeginAuthSessionViaQrRequest,
+    CAuthenticationBeginAuthSessionViaQrResponse, CAuthenticationDeviceDetails,
     CAuthenticationGetPasswordRsaPublicKeyRequest,
     CAuthenticationGetPasswordRsaPublicKeyResponse,
     CAuthenticationPollAuthSessionStatusRequest,
@@ -99,6 +100,10 @@ impl AuthSession {
 pub struct AuthTokens {
     pub refresh_token: String,
     pub access_token: String,
+    /// Only ever populated for a QR-initiated session -- a credentials
+    /// session already told the caller the account name up front, so
+    /// there's nothing new to report there.
+    pub account_name: Option<String>,
 }
 
 /// Get the RSA public key for encrypting a password.
@@ -191,6 +196,50 @@ pub async fn begin_auth_session(
         allowed_confirmations: allowed,
         interval: resp.interval.unwrap_or(5.0),
     })
+}
+
+/// Begin a QR-code auth session -- no password ever handled by this
+/// process at all. The returned `challenge_url` is what the Steam mobile
+/// app scans (or, opened directly in a browser/device with the app
+/// installed, deep-links into it); the caller then polls the same way as
+/// any other auth session until it's confirmed.
+pub async fn begin_auth_session_qr(conn: &mut CmConnection) -> Result<(AuthSession, String)> {
+    let req = CAuthenticationBeginAuthSessionViaQrRequest {
+        website_id: Some("Client".to_string()),
+        platform_type: Some(1), // SteamClient
+        device_details: Some(CAuthenticationDeviceDetails {
+            device_friendly_name: Some("steamdepot-rs".to_string()),
+            platform_type: Some(1),
+            os_type: Some(20), // Linux
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let resp_bytes = conn
+        .service_method_call("Authentication.BeginAuthSessionViaQR#1", &req.encode_to_vec())
+        .await?;
+    let resp = CAuthenticationBeginAuthSessionViaQrResponse::decode(resp_bytes.as_slice())?;
+
+    let allowed: Vec<i32> = resp
+        .allowed_confirmations
+        .iter()
+        .filter_map(|c| c.confirmation_type)
+        .collect();
+    let challenge_url = resp.challenge_url.unwrap_or_default();
+
+    Ok((
+        AuthSession {
+            client_id: resp.client_id.unwrap_or(0),
+            request_id: resp.request_id.unwrap_or_default(),
+            // Not known until the QR is scanned and approved -- poll_auth_status
+            // doesn't send steam_id in its request at all, so this is never
+            // actually read before that happens.
+            steam_id: 0,
+            allowed_confirmations: allowed,
+            interval: resp.interval.unwrap_or(5.0),
+        },
+        challenge_url,
+    ))
 }
 
 /// Begin a passwordless auth session (for newly created accounts with no password).
@@ -286,6 +335,7 @@ pub async fn poll_auth_status(
                 return Ok(AuthTokens {
                     refresh_token: refresh,
                     access_token: resp.access_token.unwrap_or_default(),
+                    account_name: resp.account_name,
                 });
             }
         }

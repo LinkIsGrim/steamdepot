@@ -52,6 +52,24 @@ pub async fn begin(username: &str, password: &str) -> Result<(CmConnection, Auth
     Ok((conn, session))
 }
 
+/// Begin a QR-code auth session -- no password handled by this process at
+/// all. Returns the challenge URL to display/open alongside the session;
+/// [`poll`] blocks until it's confirmed (scanned with the Steam mobile
+/// app, or opened directly on a device that has it installed) the same
+/// way as any other session.
+///
+/// ```ignore
+/// let (mut conn, session, url) = auth::begin_qr().await?;
+/// println!("Open {url} (or scan it) to confirm...");
+/// let tokens = auth::poll(&mut conn, &session).await?;
+/// // tokens.account_name is Some(..) here -- the caller never had to know it upfront.
+/// ```
+pub async fn begin_qr() -> Result<(CmConnection, AuthSession, String)> {
+    let mut conn = connect_and_login().await?;
+    let (session, challenge_url) = login::begin_auth_session_qr(&mut conn).await?;
+    Ok((conn, session, challenge_url))
+}
+
 /// Begin a passwordless auth session for a newly created account.
 ///
 /// Resolves a CM server, connects, and starts an auth session with just the
