@@ -572,7 +572,10 @@ fn decompress_chunk(data: &[u8]) -> Result<Vec<u8>> {
         let mut file = archive
             .by_index(0)
             .map_err(|e| Error::Other(format!("chunk zip entry: {}", e)))?;
-        let mut buf = Vec::new();
+        // Pre-sized from the ZIP entry's own uncompressed-size field --
+        // authoritative archive-format metadata, not a guess (unlike the
+        // VZstd case below, which is why that one's left alone).
+        let mut buf = Vec::with_capacity(file.size() as usize);
         std::io::Read::read_to_end(&mut file, &mut buf)?;
         Ok(buf)
     } else {
@@ -595,7 +598,16 @@ fn decompress_vzstd(data: &[u8]) -> Result<Vec<u8>> {
     let zstd_data = &data[8..data.len() - 15];
     let mut decoder = ruzstd::StreamingDecoder::new(zstd_data)
         .map_err(|e| Error::Other(format!("VZstd init: {}", e)))?;
-    let mut output = Vec::new();
+    // Pre-sized from the footer's own decompressed-size field, verified
+    // against SteamKit2's actual VZstdUtil.cs (not guessed): the footer is
+    // CRC32(4) + decompressed_size(4, as a plain `int`) + 4 unused/
+    // reserved bytes + "zsv"(3) = 15 bytes, with the size at the same
+    // relative offset (footer[4..8]) as decompress_vzip_lzma's footer
+    // below. ruzstd doesn't use this value for anything itself -- it's
+    // purely a capacity hint here, same reasoning as the VZip case.
+    let footer = &data[data.len() - 15..];
+    let decompressed_size = u32::from_le_bytes([footer[4], footer[5], footer[6], footer[7]]);
+    let mut output = Vec::with_capacity(decompressed_size as usize);
     std::io::Read::read_to_end(&mut decoder, &mut output)?;
     Ok(output)
 }
