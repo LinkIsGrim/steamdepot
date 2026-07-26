@@ -66,11 +66,20 @@ pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], input: &[u8]) -> Result<Vec<u8>> {
     let decryptor = Aes256CbcDec::new_from_slices(key, iv)
         .map_err(|e| Error::Other(format!("AES-CBC init: {}", e)))?;
 
-    let plaintext = decryptor
+    // decrypt_padded_mut already decrypts in place inside `buf`, returning
+    // a sub-slice of it with the PKCS7 padding excluded -- truncate `buf`
+    // to that length and return it directly instead of copying the
+    // plaintext out into a second, brand-new allocation. The in-place API
+    // was already being used correctly; the previous `plaintext.to_vec()`
+    // just threw that away with a redundant full-buffer copy on every
+    // chunk decrypted.
+    let plaintext_len = decryptor
         .decrypt_padded_mut::<Pkcs7>(&mut buf)
-        .map_err(|e| Error::Other(format!("AES-CBC decrypt: {}", e)))?;
+        .map_err(|e| Error::Other(format!("AES-CBC decrypt: {}", e)))?
+        .len();
+    buf.truncate(plaintext_len);
 
-    Ok(plaintext.to_vec())
+    Ok(buf)
 }
 
 /// Decrypt an encrypted manifest filename.
@@ -141,4 +150,43 @@ fn aes_ecb_decrypt_block(key: &[u8], block: &[u8]) -> Result<Vec<u8>> {
     output.copy_from_slice(block);
     cipher.decrypt_block(aes::Block::from_mut_slice(&mut output));
     Ok(output.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cbc::cipher::BlockEncryptMut;
+
+    type Aes256CbcEnc = cbc::Encryptor<Aes256>;
+
+    /// Round-trips real plaintext through encrypt-then-aes_cbc_decrypt --
+    /// specifically to confirm the truncate-instead-of-copy change above
+    /// still returns exactly the original plaintext, not just "doesn't
+    /// panic". Covers both a size that needs multiple padding bytes and
+    /// one that lands on an exact block boundary (a full 16-byte block of
+    /// pure padding), since those exercise different PKCS7 edge cases.
+    fn roundtrip(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) {
+        let encryptor = Aes256CbcEnc::new_from_slices(key, iv).unwrap();
+        let mut buf = vec![0u8; plaintext.len() + 16];
+        buf[..plaintext.len()].copy_from_slice(plaintext);
+        let ciphertext_len = encryptor
+            .encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext.len())
+            .unwrap()
+            .len();
+        buf.truncate(ciphertext_len);
+
+        let decrypted = aes_cbc_decrypt(key, iv, &buf).expect("decrypt failed");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn aes_cbc_decrypt_roundtrips() {
+        let key = [0x42u8; 32];
+        let iv = [0x24u8; 16];
+
+        roundtrip(&key, &iv, b"a short chunk of plaintext");
+        roundtrip(&key, &iv, &[0u8; 16]); // exact block boundary -- full pad block
+        roundtrip(&key, &iv, &[0xABu8; 1024]); // larger, multi-block
+        roundtrip(&key, &iv, b"");
+    }
 }
