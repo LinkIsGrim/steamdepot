@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -149,6 +150,33 @@ pub async fn prepare_directory_tree(
     Ok(result)
 }
 
+/// Hex-encode `bytes` in one allocation. Not `bytes.iter().map(|b|
+/// format!("{:02x}", b)).collect()`, which heap-allocates a throwaway
+/// `String` per byte -- confirmed live as real, avoidable allocator churn:
+/// a 20-byte SHA1 was 20 small allocations, once per chunk verified *and*
+/// once per chunk job built, across every chunk in every depot synced.
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
+    }
+    s
+}
+
+thread_local! {
+    // Reused across every chunk verified on this thread instead of a fresh
+    // `vec![0u8; size]` per chunk -- this runs inside `spawn_blocking`,
+    // whose pool is a small, bounded, *reused* set of OS threads, so a
+    // thread-local buffer here genuinely gets reused across many chunks,
+    // not allocated fresh per call. `resize` only grows the underlying
+    // allocation when a chunk is larger than any seen so far on this
+    // thread; it never shrinks the actual capacity back down, so this
+    // stabilizes at the largest chunk size once warmed up.
+    static VERIFY_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
 /// Read `size` bytes at `offset` from `path` and check them against the
 /// chunk's expected (decompressed) SHA1, using a positioned read against an
 /// already-open, shared file handle (see [`open_verify_files`]) instead of
@@ -157,19 +185,23 @@ pub async fn prepare_directory_tree(
 /// concurrently off one `File`. Any I/O error is treated as "not verified"
 /// (falls back to redownloading that chunk).
 fn verify_chunk_on_disk(file: &std::fs::File, offset: u64, size: u64, expected_sha_hex: &str) -> bool {
-    (|| -> Result<bool> {
-        use sha1::{Digest, Sha1};
+    VERIFY_BUF.with(|buf| {
+        (|| -> Result<bool> {
+            use sha1::{Digest, Sha1};
 
-        let mut buf = vec![0u8; size as usize];
-        read_exact_at(file, &mut buf, offset)?;
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            buf.resize(size as usize, 0);
+            read_exact_at(file, &mut buf, offset)?;
 
-        let mut hasher = Sha1::new();
-        hasher.update(&buf);
-        let actual_hex: String = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+            let mut hasher = Sha1::new();
+            hasher.update(&buf[..]);
+            let actual_hex = hex_encode(&hasher.finalize());
 
-        Ok(actual_hex.eq_ignore_ascii_case(expected_sha_hex))
-    })()
-    .unwrap_or(false)
+            Ok(actual_hex.eq_ignore_ascii_case(expected_sha_hex))
+        })()
+        .unwrap_or(false)
+    })
 }
 
 /// Positioned read (`pread` on Unix, `seek_read` on Windows) that doesn't
@@ -295,7 +327,7 @@ pub async fn sync_depot(
 
         for chunk in &mapping.chunks {
             let sha_bytes = chunk.sha.as_deref().unwrap_or(&[]);
-            let sha_hex: String = sha_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            let sha_hex = hex_encode(sha_bytes);
             jobs.push(ChunkJob {
                 path: path.clone(),
                 sha_hex,
@@ -598,7 +630,11 @@ fn decompress_vzip_lzma(data: &[u8]) -> Result<Vec<u8>> {
     lzma_stream.extend_from_slice(&decompressed_size.to_le_bytes());
     lzma_stream.extend_from_slice(compressed);
 
-    let mut output = Vec::new();
+    // Pre-sized, not Vec::new() -- the decompressed size is already known
+    // right above (read from the chunk's own footer), so there's no reason
+    // to pay for lzma_decompress's incremental grow-and-copy reallocations
+    // as it writes output it could have had room for from the start.
+    let mut output = Vec::with_capacity(decompressed_size as usize);
     lzma_rs::lzma_decompress(&mut std::io::Cursor::new(&lzma_stream), &mut output)
         .map_err(|e| Error::Other(format!("VZip LZMA decompress: {}", e)))?;
 
