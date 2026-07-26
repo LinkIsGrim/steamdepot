@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use flate2::read::GzDecoder;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -29,10 +30,21 @@ type WsStream = SplitStream<WsStreamInner>;
 const PROTO_MASK: u32 = 0x80000000;
 
 /// Parsed Steam CM message.
+///
+/// `body` is `Bytes`, not `Vec<u8>` -- confirmed live that every message
+/// body was being copied out of its owning WebSocket frame buffer via
+/// `.to_vec()` in `parse_raw_frame`, once per message received, purely to
+/// satisfy an owned-`Vec<u8>` return type nothing downstream actually
+/// needed: `prost::Message::decode` accepts anything implementing
+/// `bytes::Buf`, which `Bytes` itself implements directly. `Bytes` is
+/// cheaply sub-sliceable without copying (`.slice()`, reference-counted
+/// internally), so the frame buffer received from tungstenite gets wrapped
+/// exactly once and every narrower view into it (header vs. body, or a
+/// CMsgMulti sub-message) is a zero-copy slice of that same allocation.
 pub struct CmMessage {
     pub emsg: EMsg,
     pub header: CMsgProtoBufHeader,
-    pub body: Vec<u8>,
+    pub body: Bytes,
 }
 
 /// Raw parsed frame, before EMsg lookup.
@@ -40,7 +52,7 @@ struct RawFrame {
     emsg_val: u32,
     is_proto: bool,
     header: CMsgProtoBufHeader,
-    body: Vec<u8>,
+    body: Bytes,
 }
 
 /// Shared write half of the WebSocket, wrapped for concurrent access.
@@ -184,7 +196,7 @@ impl CmConnection {
         &mut self,
         method: &str,
         body: &[u8],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         let job_id = NEXT_JOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let mut header = self.session_header()?;
@@ -232,7 +244,7 @@ impl CmConnection {
         &mut self,
         method: &str,
         body: &[u8],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         let job_id = NEXT_JOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let header = CMsgProtoBufHeader {
@@ -316,7 +328,7 @@ async fn send_raw(
     Ok(())
 }
 
-fn parse_raw_frame(data: &[u8]) -> Result<RawFrame> {
+fn parse_raw_frame(data: &Bytes) -> Result<RawFrame> {
     if data.len() < 8 {
         return Err(Error::MessageTooShort(data.len()));
     }
@@ -332,7 +344,11 @@ fn parse_raw_frame(data: &[u8]) -> Result<RawFrame> {
             return Err(Error::MessageTruncated);
         }
         let header = CMsgProtoBufHeader::decode(&data[8..8 + header_len])?;
-        let body = data[8 + header_len..].to_vec();
+        // .slice(), not .to_vec() -- a zero-copy view into the same
+        // reference-counted buffer `data` already owns, not a fresh
+        // allocation. See CmMessage's own doc for why this is safe/enough
+        // for every actual consumer downstream.
+        let body = data.slice(8 + header_len..);
         Ok(RawFrame {
             emsg_val,
             is_proto: true,
@@ -370,7 +386,7 @@ fn parse_raw_frame(data: &[u8]) -> Result<RawFrame> {
         } else {
             CMsgProtoBufHeader::default()
         };
-        let body = data[skip..].to_vec();
+        let body = data.slice(skip..);
         Ok(RawFrame {
             emsg_val,
             is_proto: false,
@@ -386,7 +402,7 @@ fn parse_raw_frame(data: &[u8]) -> Result<RawFrame> {
 
 struct CmStream {
     stream: WsStream,
-    queue: VecDeque<Vec<u8>>,
+    queue: VecDeque<Bytes>,
 }
 
 impl CmStream {
@@ -429,13 +445,20 @@ impl CmStream {
 
     fn unpack_multi(&mut self, body: &[u8]) -> Result<()> {
         let multi = CMsgMulti::decode(body)?;
-        let payload = match (multi.message_body, multi.size_unzipped) {
+        // Wrapped into Bytes once here (whichever branch), not per
+        // sub-message below -- multi.message_body itself is still
+        // Vec<u8> (a plain prost-generated `bytes` field, unrelated to
+        // this crate's own internal buffer-copy story), so this is the
+        // one unavoidable copy in this path: converting prost's owned Vec
+        // into a shareable Bytes. Every sub-message slice after this is
+        // then genuinely zero-copy.
+        let payload: Bytes = match (multi.message_body, multi.size_unzipped) {
             (Some(body), Some(size)) if size > 0 => {
                 let mut decompressed = Vec::with_capacity(size as usize);
                 GzDecoder::new(body.as_slice()).read_to_end(&mut decompressed)?;
-                decompressed
+                decompressed.into()
             }
-            (Some(body), _) => body,
+            (Some(body), _) => body.into(),
             (None, _) => return Ok(()),
         };
 
@@ -447,13 +470,13 @@ impl CmStream {
             if offset + len > payload.len() {
                 break;
             }
-            self.queue.push_back(payload[offset..offset + len].to_vec());
+            self.queue.push_back(payload.slice(offset..offset + len));
             offset += len;
         }
         Ok(())
     }
 
-    async fn recv_raw(&mut self) -> Result<Vec<u8>> {
+    async fn recv_raw(&mut self) -> Result<Bytes> {
         loop {
             let msg = self
                 .stream
@@ -461,6 +484,10 @@ impl CmStream {
                 .await
                 .ok_or(Error::ConnectionClosed)??;
             match msg {
+                // Wrapped into Bytes here, once, right where tungstenite
+                // hands over ownership of the frame's Vec<u8> -- this is
+                // the single point every message body's buffer traces
+                // back to; see CmMessage's own doc.
                 tungstenite::Message::Binary(data) => return Ok(data.into()),
                 tungstenite::Message::Close(_) => return Err(Error::ConnectionClosed),
                 _ => continue,

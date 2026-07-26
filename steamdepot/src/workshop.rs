@@ -49,7 +49,7 @@ pub async fn get_details(
     let resp_bytes = conn
         .service_method_call("PublishedFile.GetDetails#1", &req.encode_to_vec())
         .await?;
-    let resp = CPublishedFileGetDetailsResponse::decode(resp_bytes.as_slice())?;
+    let resp = CPublishedFileGetDetailsResponse::decode(resp_bytes)?;
 
     let mut items = Vec::new();
     for details in resp.publishedfiledetails {

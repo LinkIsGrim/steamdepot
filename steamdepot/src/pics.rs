@@ -66,7 +66,7 @@ async fn get_access_tokens(
             continue;
         }
 
-        let resp = CMsgClientPicsAccessTokenResponse::decode(msg.body.as_slice())?;
+        let resp = CMsgClientPicsAccessTokenResponse::decode(msg.body)?;
 
         let app_tokens: Vec<(u32, u64)> = resp
             .app_access_tokens
@@ -148,7 +148,7 @@ pub async fn get_product_info(
             continue;
         }
 
-        let resp = PicsResponse::decode(msg.body.as_slice())?;
+        let resp = PicsResponse::decode(msg.body)?;
 
         for app in resp.apps {
             result.apps.push(AppProductInfo {
@@ -206,7 +206,7 @@ pub async fn get_depot_decryption_key(
             continue;
         }
 
-        let resp = CMsgClientGetDepotDecryptionKeyResponse::decode(msg.body.as_slice())?;
+        let resp = CMsgClientGetDepotDecryptionKeyResponse::decode(msg.body)?;
 
         let eresult = resp.eresult.unwrap_or(2);
         if eresult != 1 {
@@ -264,7 +264,7 @@ pub async fn request_free_license(
             continue;
         }
 
-        let resp = CMsgClientRequestFreeLicenseResponse::decode(msg.body.as_slice())?;
+        let resp = CMsgClientRequestFreeLicenseResponse::decode(msg.body)?;
 
         let eresult = resp.eresult.unwrap_or(2);
         if eresult != 1 {

@@ -174,7 +174,7 @@ pub async fn get_manifest_request_code(
             .await
         {
             Ok(resp_bytes) => {
-                let resp = ManifestCodeResponse::decode(resp_bytes.as_slice())?;
+                let resp = ManifestCodeResponse::decode(resp_bytes)?;
                 let code = resp.manifest_request_code.unwrap_or(0);
                 if code == 0 {
                     return Err(Error::Other(format!(
@@ -224,7 +224,7 @@ pub async fn get_cdn_servers(
             .await
         {
             Ok(resp_bytes) => {
-                let resp = SteamPipeResponse::decode(resp_bytes.as_slice())?;
+                let resp = SteamPipeResponse::decode(resp_bytes)?;
                 return Ok(resp
                     .servers
                     .into_iter()
@@ -281,7 +281,7 @@ pub async fn request_cdn_auth_token(
             .await
         {
             Ok(resp_bytes) => {
-                let resp = CdnAuthTokenResponse::decode(resp_bytes.as_slice())?;
+                let resp = CdnAuthTokenResponse::decode(resp_bytes)?;
                 return Ok(CdnAuthToken {
                     token: resp.token.unwrap_or_default(),
                     expiration: resp.expiration_time.unwrap_or(0),

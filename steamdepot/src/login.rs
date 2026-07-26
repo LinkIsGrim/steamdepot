@@ -120,7 +120,7 @@ pub async fn get_password_rsa_key(
             &req.encode_to_vec(),
         )
         .await?;
-    let resp = CAuthenticationGetPasswordRsaPublicKeyResponse::decode(resp_bytes.as_slice())?;
+    let resp = CAuthenticationGetPasswordRsaPublicKeyResponse::decode(resp_bytes)?;
     Ok(RsaKey {
         modulus: resp.publickey_mod.unwrap_or_default(),
         exponent: resp.publickey_exp.unwrap_or_default(),
@@ -181,7 +181,7 @@ pub async fn begin_auth_session(
         )
         .await?;
     let resp =
-        CAuthenticationBeginAuthSessionViaCredentialsResponse::decode(resp_bytes.as_slice())?;
+        CAuthenticationBeginAuthSessionViaCredentialsResponse::decode(resp_bytes)?;
 
     let allowed: Vec<i32> = resp
         .allowed_confirmations
@@ -218,7 +218,7 @@ pub async fn begin_auth_session_qr(conn: &mut CmConnection) -> Result<(AuthSessi
     let resp_bytes = conn
         .service_method_call("Authentication.BeginAuthSessionViaQR#1", &req.encode_to_vec())
         .await?;
-    let resp = CAuthenticationBeginAuthSessionViaQrResponse::decode(resp_bytes.as_slice())?;
+    let resp = CAuthenticationBeginAuthSessionViaQrResponse::decode(resp_bytes)?;
 
     let allowed: Vec<i32> = resp
         .allowed_confirmations
@@ -272,7 +272,7 @@ pub async fn begin_auth_session_passwordless(
         )
         .await?;
     let resp =
-        CAuthenticationBeginAuthSessionViaCredentialsResponse::decode(resp_bytes.as_slice())?;
+        CAuthenticationBeginAuthSessionViaCredentialsResponse::decode(resp_bytes)?;
 
     let allowed: Vec<i32> = resp
         .allowed_confirmations
@@ -328,7 +328,7 @@ pub async fn poll_auth_status(
             )
             .await?;
         let resp =
-            CAuthenticationPollAuthSessionStatusResponse::decode(resp_bytes.as_slice())?;
+            CAuthenticationPollAuthSessionStatusResponse::decode(resp_bytes)?;
 
         if let Some(refresh) = resp.refresh_token {
             if !refresh.is_empty() {
@@ -431,7 +431,7 @@ async fn await_logon_response(conn: &mut CmConnection) -> Result<SessionState> {
         });
     }
 
-    let resp = CMsgClientLogonResponse::decode(msg.body.as_slice())?;
+    let resp = CMsgClientLogonResponse::decode(msg.body)?;
 
     let eresult = resp.eresult.unwrap_or(2);
     if eresult != 1 {

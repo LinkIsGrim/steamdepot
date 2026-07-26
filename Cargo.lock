@@ -1642,6 +1642,7 @@ version = "0.3.11"
 dependencies = [
  "aes",
  "base64",
+ "bytes",
  "cbc",
  "ecb",
  "flate2",
