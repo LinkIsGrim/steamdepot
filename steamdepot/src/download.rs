@@ -505,8 +505,14 @@ async fn fetch_and_process(
     let encrypted = resp.bytes().await?;
     let encrypted_len = encrypted.len() as u64;
 
-    // Decrypt
-    let decrypted = crypto::symmetric_decrypt(depot_key, &encrypted)?;
+    // Decrypt in place on the buffer reqwest already gave us -- try_into_mut
+    // is O(1) (no copy) since nothing else holds a clone of this Bytes at
+    // this point; the rare Err case (unexpectedly shared) falls back to one
+    // copy instead of failing outright.
+    let buf = encrypted
+        .try_into_mut()
+        .unwrap_or_else(|shared| bytes::BytesMut::from(&shared[..]));
+    let decrypted = crypto::symmetric_decrypt_mut(depot_key, buf)?;
 
     // Decompress
     let decompressed = decompress_chunk(&decrypted)?;
