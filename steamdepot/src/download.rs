@@ -31,6 +31,85 @@ pub struct PrepareResult {
     pub verify_candidates: Vec<PathBuf>,
 }
 
+/// How a manifest filename becomes a path on disk.
+///
+/// Depot content is authored on Windows, so manifests carry backslashes
+/// and whatever casing the author used. Separators are always normalized;
+/// casing is a choice, because some consumers need it folded and some
+/// must not have it touched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PathOptions {
+    /// Write every path in lowercase.
+    ///
+    /// For Arma 3 (and other engines that build internal paths in
+    /// lowercase), content on a case-sensitive filesystem is unusable
+    /// otherwise -- the engine reports `The filename '...' is not
+    /// lowercase. You have to convert it!` and skips the file.
+    ///
+    /// This belongs here, rather than in a pass that renames files after
+    /// the fact, because the manifest is also what the *next* sync
+    /// verifies against. A post-hoc rename leaves the tree no longer
+    /// matching the manifest, so `prepare_directory_tree` (which only
+    /// ever creates, never prunes) re-creates every renamed file under
+    /// its original name on the next content update, and the folded
+    /// copies are left beside them -- the engine then loads both. Folding
+    /// at the point the path is derived keeps the mapping total and
+    /// one-way, so that state can't arise and incremental chunk
+    /// verification keeps working across updates.
+    pub lowercase: bool,
+}
+
+impl PathOptions {
+    /// Manifest casing, separators normalized. The default.
+    pub fn preserve_case() -> Self {
+        Self { lowercase: false }
+    }
+
+    /// Fold every path to lowercase -- see [`PathOptions::lowercase`].
+    pub fn lowercase() -> Self {
+        Self { lowercase: true }
+    }
+
+    /// A manifest filename as a depot-relative path.
+    fn relative(&self, filename: &str) -> String {
+        let normalized = filename.replace('\\', "/");
+        if self.lowercase {
+            normalized.to_lowercase()
+        } else {
+            normalized
+        }
+    }
+}
+
+/// Reject a manifest whose filenames would collide once folded.
+///
+/// Only possible with [`PathOptions::lowercase`], and only for content
+/// shipping two names differing solely by case. Refusing up front is
+/// deliberate: folding them would have one silently overwrite the other,
+/// which loses content and is far harder to diagnose than a failed sync
+/// naming both paths.
+fn check_for_collisions(manifest: &DepotManifest, options: PathOptions) -> Result<()> {
+    if !options.lowercase {
+        return Ok(());
+    }
+    let mut seen: HashMap<String, &str> = HashMap::new();
+    for mapping in &manifest.payload.mappings {
+        let Some(filename) = mapping.filename.as_deref() else {
+            continue;
+        };
+        let folded = options.relative(filename);
+        if let Some(previous) = seen.insert(folded.clone(), filename) {
+            if previous != filename {
+                return Err(Error::Other(format!(
+                    "cannot lowercase this depot: {previous:?} and {filename:?} both become \
+                     {folded:?}, so one would overwrite the other"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Decrypt all encrypted filenames in a manifest in-place.
 ///
 /// If `metadata.filenames_encrypted` is false (or absent), this is a no-op.
@@ -64,7 +143,10 @@ pub fn decrypt_manifest_filenames(manifest: &mut DepotManifest, key: &[u8]) -> R
 pub async fn prepare_directory_tree(
     install_dir: &Path,
     manifest: &DepotManifest,
+    options: PathOptions,
 ) -> Result<PrepareResult> {
+    check_for_collisions(manifest, options)?;
+
     let mut result = PrepareResult {
         dirs_created: 0,
         files_created: 0,
@@ -89,8 +171,7 @@ pub async fn prepare_directory_tree(
         let flags = mapping.flags.unwrap_or(0);
         let size = mapping.size.unwrap_or(0);
 
-        // Normalize path separators (manifests may use backslashes)
-        let normalized = filename.replace('\\', "/");
+        let normalized = options.relative(filename);
         let path = install_dir.join(&normalized);
 
         if flags & FLAG_DIRECTORY != 0 {
@@ -104,6 +185,12 @@ pub async fn prepare_directory_tree(
                     filename
                 )));
             }
+            // The target names another path in this same depot, so it has
+            // to go through the same mapping -- otherwise a folded tree
+            // gets symlinks pointing at the unfolded names, which no
+            // longer exist.
+            let target = options.relative(target);
+            let target = target.as_str();
             // Ensure parent dir exists
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
@@ -294,9 +381,10 @@ pub async fn sync_depot(
     depot_key: &[u8],
     install_dir: &Path,
     max_concurrent: usize,
+    options: PathOptions,
     on_progress: impl Fn(&DownloadProgress) + Send + Sync + 'static,
 ) -> Result<(PrepareResult, DownloadProgress)> {
-    let prepared = prepare_directory_tree(install_dir, manifest).await?;
+    let prepared = prepare_directory_tree(install_dir, manifest, options).await?;
     let verify_candidates: HashSet<PathBuf> = prepared.verify_candidates.iter().cloned().collect();
     // Open each verify candidate exactly once, up front, instead of every
     // one of its chunks opening the file itself -- a depot's chunks are
@@ -321,7 +409,9 @@ pub async fn sync_depot(
             continue;
         }
 
-        let normalized = filename.replace('\\', "/");
+        // Same mapping prepare_directory_tree used, so verification and
+        // download always address the file it actually created.
+        let normalized = options.relative(filename);
         let path = install_dir.join(&normalized);
         let verify_file = verify_files.get(&path).cloned();
 
@@ -695,4 +785,170 @@ fn adler32_steam(data: &[u8]) -> u32 {
     }
 
     (s2 << 16) | s1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::content_manifest_payload::FileMapping;
+    use crate::proto::ContentManifestPayload;
+
+    fn mapping(filename: &str, flags: u32, size: u64) -> FileMapping {
+        FileMapping {
+            filename: Some(filename.to_string()),
+            flags: Some(flags),
+            size: Some(size),
+            ..Default::default()
+        }
+    }
+
+    fn manifest(mappings: Vec<FileMapping>) -> DepotManifest {
+        DepotManifest {
+            payload: ContentManifestPayload { mappings },
+            metadata: Default::default(),
+            signature: Default::default(),
+        }
+    }
+
+    #[test]
+    fn separators_are_normalized_in_both_modes() {
+        for options in [PathOptions::preserve_case(), PathOptions::lowercase()] {
+            assert!(!options.relative("addons\\sub\\x.pbo").contains('\\'));
+        }
+    }
+
+    #[test]
+    fn preserve_case_leaves_casing_alone() {
+        assert_eq!(
+            PathOptions::preserve_case().relative("Addons\\AIMEE_main.pbo"),
+            "Addons/AIMEE_main.pbo"
+        );
+    }
+
+    #[test]
+    fn lowercase_folds_the_whole_path() {
+        // The directory component matters as much as the basename: Arma
+        // reports the full path, so a mixed-case directory is just as
+        // unusable as a mixed-case file.
+        assert_eq!(
+            PathOptions::lowercase().relative("Addons\\AIMEE_main.pbo"),
+            "addons/aimee_main.pbo"
+        );
+    }
+
+    #[test]
+    fn collisions_are_only_possible_when_folding() {
+        let m = manifest(vec![
+            mapping("addons/Foo.pbo", 0, 1),
+            mapping("addons/foo.pbo", 0, 1),
+        ]);
+        // Preserving case, the two are simply different files.
+        assert!(check_for_collisions(&m, PathOptions::preserve_case()).is_ok());
+
+        // Folding, one would silently overwrite the other -- refuse, and
+        // name both paths so the depot can be identified.
+        let err = check_for_collisions(&m, PathOptions::lowercase()).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("Foo.pbo"), "{message}");
+        assert!(message.contains("foo.pbo"), "{message}");
+    }
+
+    #[test]
+    fn an_ordinary_depot_has_no_collisions() {
+        let m = manifest(vec![
+            mapping("Addons/AIMEE_main.pbo", 0, 1),
+            mapping("Addons/AIMEE_group.pbo", 0, 1),
+        ]);
+        assert!(check_for_collisions(&m, PathOptions::lowercase()).is_ok());
+    }
+
+    #[test]
+    fn a_repeated_identical_filename_is_not_a_collision() {
+        // Same name twice is not two files fighting over one path.
+        let m = manifest(vec![
+            mapping("addons/x.pbo", 0, 1),
+            mapping("addons/x.pbo", 0, 1),
+        ]);
+        assert!(check_for_collisions(&m, PathOptions::lowercase()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn prepare_creates_folded_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let m = manifest(vec![
+            mapping("Addons", FLAG_DIRECTORY, 0),
+            mapping("Addons/AIMEE_main.pbo", 0, 4),
+        ]);
+
+        prepare_directory_tree(dir.path(), &m, PathOptions::lowercase())
+            .await
+            .unwrap();
+
+        assert!(dir.path().join("addons").is_dir());
+        assert!(dir.path().join("addons/aimee_main.pbo").is_file());
+        // The name the manifest used must not also appear -- that is the
+        // duplicate this option exists to prevent.
+        assert!(!dir.path().join("Addons/AIMEE_main.pbo").exists());
+    }
+
+    #[tokio::test]
+    async fn prepare_preserves_case_by_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let m = manifest(vec![
+            mapping("Addons", FLAG_DIRECTORY, 0),
+            mapping("Addons/AIMEE_main.pbo", 0, 4),
+        ]);
+
+        prepare_directory_tree(dir.path(), &m, PathOptions::preserve_case())
+            .await
+            .unwrap();
+
+        assert!(dir.path().join("Addons/AIMEE_main.pbo").is_file());
+    }
+
+    /// Re-preparing a folded tree must recognise what it already created,
+    /// rather than making a second copy. This is what keeps incremental
+    /// verification working across content updates.
+    #[tokio::test]
+    async fn preparing_a_folded_tree_twice_finds_the_existing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let m = manifest(vec![
+            mapping("Addons", FLAG_DIRECTORY, 0),
+            mapping("Addons/AIMEE_main.pbo", 0, 4),
+        ]);
+        let options = PathOptions::lowercase();
+
+        prepare_directory_tree(dir.path(), &m, options).await.unwrap();
+        let second = prepare_directory_tree(dir.path(), &m, options).await.unwrap();
+
+        // Already at the manifest's size, so it is offered for chunk
+        // verification instead of being recreated.
+        assert_eq!(
+            second.verify_candidates,
+            vec![dir.path().join("addons/aimee_main.pbo")]
+        );
+        assert_eq!(second.files_created, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_target_is_folded_with_its_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut link = mapping("Addons/Link.pbo", FLAG_SYMLINK, 0);
+        link.linktarget = Some("Addons\\AIMEE_main.pbo".to_string());
+        let m = manifest(vec![
+            mapping("Addons", FLAG_DIRECTORY, 0),
+            mapping("Addons/AIMEE_main.pbo", 0, 4),
+            link,
+        ]);
+
+        prepare_directory_tree(dir.path(), &m, PathOptions::lowercase())
+            .await
+            .unwrap();
+
+        // Pointing at the unfolded name would dangle -- that file does
+        // not exist in a folded tree.
+        let target = std::fs::read_link(dir.path().join("addons/link.pbo")).unwrap();
+        assert_eq!(target, Path::new("addons/aimee_main.pbo"));
+    }
 }

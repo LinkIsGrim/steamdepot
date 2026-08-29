@@ -547,7 +547,7 @@ async fn main() -> Result<()> {
                         log.prepare(app_id, dp.depot.depot_id, install_dir);
 
                         let result =
-                            download::prepare_directory_tree(install_dir, manifest).await?;
+                            download::prepare_directory_tree(install_dir, manifest, download::PathOptions::preserve_case()).await?;
                         log.prepared(app_id, dp.depot.depot_id, &result);
 
                         let mut cdn_pool = CdnPool::new(plan.cdn_servers.clone());
